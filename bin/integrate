@@ -1,0 +1,96 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+
+require 'optparse'
+require_relative '../lib/integrator'
+
+# для терминала экранируем управляющие символы но исходный ir не меняем
+def terminal_view(value)
+  case value
+  when String
+    value.gsub(/[\u0000-\u001f\u007f-\u009f\u202a-\u202e\u2066-\u2069]/) { |char| format('\\u%04x', char.ord) }
+  when Hash then value.to_h { |key, child| [terminal_view(key), terminal_view(child)] }
+  when Array then value.map { |child| terminal_view(child) }
+  else value
+  end
+end
+
+options = {}
+parser = OptionParser.new do |opts|
+  opts.banner = 'Запуск: ruby bin/integrate --spec API.yaml [--provider name] [параметры]'
+  opts.on('--spec PATH', 'Локальный OpenAPI: YAML или JSON') { |v| options[:spec] = v }
+  opts.on('--provider NAME', 'Имя для файла и Ruby-класса') { |v| options[:provider] = v }
+  opts.on('--overrides PATH', 'Уточнения в YAML') { |v| options[:overrides] = v }
+  opts.on('--output PATH', 'Каталог для созданных файлов') { |v| options[:output] = v }
+  opts.on('--analyze', 'Анализ без создания файлов') { options[:analyze] = true }
+  opts.on('--strict', 'Код 2 при неразрешённых критических вопросах') { options[:strict] = true }
+  opts.on('--explain', 'Подробные выводы, источники и диагностика') { options[:explain] = true }
+  opts.on('--lang LANG', 'Язык сервиса: ruby') { |v| raise OptionParser::InvalidArgument, 'Only ruby is supported' unless v == 'ruby' }
+  opts.on('-h', '--help', 'Показать справку') { puts opts; exit 0 }
+end
+
+# сначала проверяем параметры запуска чтобы не начинать генерацию с неверным вводом
+begin
+  parser.parse!
+  raise OptionParser::InvalidArgument, "Unexpected arguments: #{ARGV.join(' ')}" unless ARGV.empty?
+  raise OptionParser::MissingArgument, '--spec' unless options[:spec]
+  if options[:provider] && !options[:provider].match?(/\A[A-Za-z][A-Za-z0-9_-]*\z/)
+    raise Integrator::Error, 'Provider must start with a letter and contain only letters, digits, _ or -'
+  end
+  # читаем спеку накладываем уточнения и только потом запускаем strict-проверку
+  document = Integrator::SpecLoader.new(options[:spec]).load
+  raise Integrator::Error, 'OpenAPI info must be an object' if document.key?('info') && !document['info'].is_a?(Hash)
+  provider = options[:provider] || document.dig('info', 'title').to_s.downcase.gsub(/[^a-z0-9]+/, '_').sub(/_+\z/, '')
+  provider = provider.downcase.tr('-', '_')
+  raise Integrator::Error, 'Cannot derive a safe provider name; pass --provider' unless provider.match?(/\A[a-z][a-z0-9_]*\z/)
+  ir = Integrator::Analyzer.new(document, provider: provider).analyze
+  ir = Integrator::Overrides.new(options[:overrides]).apply(ir)
+  valid = Integrator::Validator.new(ir).validate
+  display = terminal_view(ir)
+  puts "#{display['title']} — OpenAPI #{display['openapi']}"
+  puts "Найдено методов: #{display['operations'].length}\n\n"
+  display['operations'].each { |op| puts format('%-8s %-5s %s', op['role'], op['method'].upcase, op['path']) }
+  auth = display.fetch('auth_schemes', {}).map { |name, scheme| scheme['name'] || scheme['scheme'] || name }
+  puts "\nАвторизация: #{auth.empty? ? 'не указана' : auth.join(', ')}"
+  units = {'major' => 'основные единицы', 'minor' => 'минимальные единицы'}[display.dig('amount', 'unit')] || 'единицы не определены'
+  puts "Сумма: #{units} ×#{display.dig('amount', 'factor') || '?'}"
+  overrides = display.fetch('provenance', []).select { |item| item['source'] == 'override' }.map { |item| item['subject'].split('.').first }.uniq
+  puts "Overrides: #{overrides.length}"
+  # подробные источники показываем только когда их явно попросили
+  if options[:explain]
+    puts "\nАвторизация (схемы OpenAPI):"
+    display.fetch('auth_schemes', {}).each { |name, scheme| puts "  #{name}: #{scheme['type']} #{scheme['scheme']} #{scheme['in']} #{scheme['name']}" }
+    puts "\nОперации (id, role, confidence):"
+    display['operations'].each { |op| puts "  #{op['id']}: #{op['role']} [#{op['confidence']}]" }
+    puts "\nПравила:"
+    puts "  amount: #{display['amount'].inspect}"
+    display.fetch('required_if', []).each { |rule| puts "  #{rule['field']} обязательно при #{rule['when'].inspect} [#{rule['source']}]" }
+    puts "  signature: #{display['signature'].inspect}"
+    puts "\nИсточники выводов:"
+    display.fetch('provenance', []).each { |p| puts "  #{p['subject']}: #{p['source']}/#{p['confidence']} #{p['pointer']} — #{p['message']}" }
+    puts "\nДиагностика:"
+    display['diagnostics'].each { |d| puts "  #{d['severity'].upcase} #{d['code']} #{d['pointer']}: #{d['message']}\n    Что сделать: #{d['action']}" }
+    puts '  Нет замечаний' if display['diagnostics'].empty?
+  end
+  if options[:strict] && !valid
+    unless options[:explain]
+      display['diagnostics'].select { |item| %w[error critical].include?(item['severity']) }.each do |item|
+        puts "#{item['severity'].upcase} #{item['code']}: #{item['message']}\n  Что сделать: #{item['action']}"
+      end
+    end
+    puts "\nПодробная диагностика: --explain."
+    warn 'Строгая проверка не пройдена: уточните overrides или исправьте спецификацию.'
+    exit 2
+  end
+  unless options[:analyze]
+    output = options[:output] || File.join('output', provider)
+    paths = Integrator::Generator.new(ir).generate(output)
+    puts "\nСозданы файлы:"
+    visible = options[:explain] ? paths : paths.first(3)
+    visible.each { |path| puts "  #{terminal_view(File.join(output, File.basename(path)))}" }
+  end
+  puts "\nПодробная диагностика: --explain." unless options[:explain]
+rescue OptionParser::ParseError, Integrator::Error => e
+  warn "Ошибка: #{terminal_view(e.message)}"
+  exit 1
+end

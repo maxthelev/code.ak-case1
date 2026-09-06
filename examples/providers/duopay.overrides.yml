@@ -1,0 +1,4 @@
+amount: {unit: minor, factor: 100}
+request_methods:
+  card_payout: createCardPayout
+  sbp_payout: createSbpPayout

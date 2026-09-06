@@ -1,0 +1,24 @@
+# Уточнения официального кейса; это данные для генератора, а не часть его общего ядра.
+amount:
+  unit: minor
+  factor: 100
+required_if:
+  - field: recipient.bank_code
+    when: {field: recipient.type, value: sbp}
+  - field: recipient.card_number
+    when: {field: recipient.type, value: card}
+signature:
+  algorithm: HMAC-SHA256
+  header: X-NovaPay-Signature
+  signed_data: raw_body
+  encoding: hex
+status_mappings:
+  pending: in_progress
+  processing: in_progress
+  completed: approved
+  failed: rejected
+  cancelled: rejected
+request_methods:
+  sbp_payout: create
+  card_payout: create
+  check: status

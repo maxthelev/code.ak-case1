@@ -1,0 +1,18 @@
+# Synthetic contract clarification: these meanings cannot be inferred from the API.
+amount: {unit: minor, factor: 100}
+operations: {dispatchCard: create, readJob: status}
+field_mappings:
+  dispatchCard:
+    quantity: amount
+    denomination: currency
+    merchant_job: external_id
+    card.number: recipient.card_number
+  readJob:
+    ticket: provider_operation_id
+response_mappings:
+  dispatchCard: {provider_operation_id: ticket, status: verdict}
+  readJob: {provider_operation_id: ticket, status: verdict}
+status_mappings: {READY: in_progress, CLOSED: approved, VOID: rejected}
+auth:
+  MerchantToken: {credential: merchant_token}
+request_methods: {card_payout: create, check: status}

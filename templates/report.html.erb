@@ -1,0 +1,143 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; img-src data:; base-uri 'none'; form-action 'none'">
+  <title><%= h.call(data[:title]) %> — подключение API</title>
+  <style><%= css %></style>
+</head>
+<body>
+  <a class="skip-link" href="#main">К содержимому</a>
+  <header class="page-header">
+    <div class="team-mark" aria-label="Code.ak — integration generator">
+      <img class="team-logo" src="data:image/png;base64,<%= logo %>" width="56" height="28" alt="">
+      <div><span class="wordmark">Code<span>.ak</span></span>
+        <span class="team-caption">integration generator</span></div>
+    </div>
+    <p class="eyebrow">OpenAPI <%= h.call(data[:version]) %></p>
+    <h1><%= h.call(data[:title]) %></h1>
+    <p class="summary"><%= h.call(data[:summary]) %></p>
+  </header>
+  <nav aria-label="Разделы">
+    <a href="#connection">Подключение</a>
+    <% unless data[:methods].empty? -%><a href="#methods">Методы</a><% end -%>
+    <% unless data[:payments].empty? -%><a href="#payment">Выплата</a><% end -%>
+    <% unless data[:statuses].empty? -%><a href="#statuses">Статусы</a><% end -%>
+    <% unless data[:errors].empty? -%><a href="#errors">Ошибки</a><% end -%>
+    <% if data[:has_webhook] -%><a href="#webhook">Webhook</a><% end -%>
+    <a href="#notes">Overrides</a><a href="#usage">Пример</a>
+  </nav>
+  <main id="main">
+    <section id="connection">
+      <h2>Подключение</h2>
+      <dl class="connection">
+        <% data[:servers].each do |label, url| -%>
+        <dt><%= h.call(label) %></dt><dd><code><%= h.call(url) %></code></dd>
+        <% end -%>
+        <% data[:auth].each do |label, credential| -%>
+        <dt><code><%= h.call(label) %></code></dt><dd><code><%= h.call(credential) %></code></dd>
+        <% end -%>
+      </dl>
+      <p class="muted">ENV: <code><%= h.call(data[:env]) %></code></p>
+    </section>
+    <% unless data[:methods].empty? -%>
+    <section id="methods">
+      <h2>Методы</h2>
+      <ul class="endpoints">
+        <% data[:methods].each do |role, endpoint| -%>
+        <li><span><%= h.call(role) %></span><code><%= h.call(endpoint) %></code></li>
+        <% end -%>
+      </ul>
+    </section>
+    <% end -%>
+    <% unless data[:payments].empty? -%>
+    <section id="payment">
+      <h2>Выплата</h2>
+      <p><%= h.call(data[:amount]) %></p>
+      <% data[:payments].each do |payment| -%>
+      <h3><code><%= h.call(payment[:endpoint]) %></code></h3>
+      <% payment[:minima].each do |minimum| -%>
+      <p><strong><%= h.call(minimum) %></strong></p>
+      <% end -%>
+        <div class="table-scroll" tabindex="0" role="region" aria-label="Поля <%= h.call(payment[:endpoint]) %>">
+          <table><thead><tr><th scope="col">Поле API</th><th scope="col">Поле интеграции</th><th scope="col">Обязательно</th></tr></thead>
+            <tbody><% payment[:fields].each do |source, target, required| -%>
+              <tr><td><code><%= h.call(source) %></code></td><td><code><%= h.call(target) %></code></td><td><%= h.call(required) %></td></tr>
+            <% end -%></tbody>
+          </table>
+        </div>
+      <% end -%>
+      <ul><% data[:conditions].each do |condition| -%>
+        <li><%= h.call(condition) %></li>
+      <% end -%></ul>
+      <p class="muted"><%= h.call(data[:idempotency]) %></p>
+      <p><%= h.call(data[:requisites]) %></p>
+    </section>
+    <% end -%>
+    <% unless data[:statuses].empty? -%>
+    <section id="statuses">
+      <h2>Статусы</h2>
+      <ul class="status-map">
+        <% data[:statuses].each do |source, target| -%>
+        <li><code><%= h.call(source) %></code><span aria-label="переходит в">→</span><code><%= h.call(target) %></code></li>
+        <% end -%>
+      </ul>
+    </section>
+    <% end -%>
+    <% unless data[:errors].empty? -%>
+    <section id="errors">
+      <h2>Ошибки</h2>
+      <p><%= h.call(data[:failure_codes]) %></p>
+      <div class="table-scroll" tabindex="0" role="region" aria-label="Ошибки HTTP">
+        <table><thead><tr><th scope="col">Метод</th><th scope="col">HTTP</th><th scope="col">Ошибка</th></tr></thead>
+          <tbody><% data[:errors].each do |role, status, error| -%>
+            <tr><td><code><%= h.call(role) %></code></td><td><code><%= h.call(status) %></code></td><td><code><%= h.call(error) %></code></td></tr>
+          <% end -%></tbody>
+        </table>
+      </div>
+    </section>
+    <% end -%>
+    <% if data[:has_webhook] -%>
+    <section id="webhook">
+      <h2>Webhook</h2>
+      <dl class="connection">
+        <% data[:signature].each do |label, value| -%>
+        <dt><%= h.call(label) %></dt><dd><code><%= h.call(value) %></code></dd>
+        <% end -%>
+      </dl>
+      <p><%= h.call(data[:webhook]) %></p>
+      <pre tabindex="0"><code><%= h.call(data[:callback_usage]) %></code></pre>
+    </section>
+    <% end -%>
+    <section id="notes">
+      <h2>Overrides</h2>
+      <ul>
+      <% data[:notes].each do |note| -%>
+      <li><%= h.call(note) %></li>
+      <% end -%>
+      </ul>
+    </section>
+    <section id="usage">
+      <h2>Пример</h2>
+      <pre tabindex="0"><code><%= h.call(data[:usage]) %></code></pre>
+      <% unless data[:logical_methods].empty? -%>
+      <details><summary>ProviderGateway</summary>
+        <ul><% data[:logical_methods].each do |name, role| -%>
+          <li><code><%= h.call(name) %></code> → <code><%= h.call(role) %></code></li>
+        <% end -%></ul>
+        <p>external_method → request_method</p>
+        <p><%= h.call(data[:gateway_note]) %></p>
+      </details>
+      <% end -%>
+    </section>
+  </main>
+  <footer>
+    <p><a href="https://codeak.ru">Code.ak</a></p>
+    <p>Файлы</p>
+    <ul><% data[:files].each do |name| -%>
+      <li><a href="./<%= h.call(name) %>"><%= h.call(name) %></a></li>
+    <% end -%></ul>
+  </footer>
+</body>
+</html>

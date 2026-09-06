@@ -1,0 +1,66 @@
+openapi: 3.0.3
+info:
+  title: CardFlow Jobs API
+  version: 1.0.0
+servers:
+  - url: https://cardflow.example/gateway
+security:
+  - MerchantToken: []
+paths:
+  /jobs:
+    post:
+      operationId: dispatchCard
+      summary: Submit card payout
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [quantity, denomination, merchant_job, card]
+              properties:
+                quantity: {type: integer, minimum: 100, description: Amount in cents}
+                denomination: {type: string, enum: [USD]}
+                merchant_job: {type: string}
+                card:
+                  type: object
+                  required: [number]
+                  properties:
+                    number: {type: string, pattern: '^[0-9]{16}$'}
+            example:
+              quantity: 1299
+              denomination: USD
+              merchant_job: demo-job-1
+              card: {number: '4111111111111111'}
+      responses:
+        '201':
+          description: Job accepted
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Job'}
+              example: {ticket: cf-demo-1, verdict: READY}
+        '400': {description: Invalid card request}
+  /jobs/{ticket}:
+    get:
+      operationId: readJob
+      summary: Get payout status
+      parameters:
+        - name: ticket
+          in: path
+          required: true
+          schema: {type: string}
+      responses:
+        '200':
+          description: Job status. READY, CLOSED and VOID are intentionally undefined in this document.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Job'}
+components:
+  securitySchemes:
+    MerchantToken: {type: apiKey, in: query, name: merchant_token}
+  schemas:
+    Job:
+      type: object
+      required: [ticket, verdict]
+      properties:
+        ticket: {type: string}
+        verdict: {type: string, enum: [READY, CLOSED, VOID]}

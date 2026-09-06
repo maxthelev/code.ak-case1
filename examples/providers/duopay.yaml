@@ -1,0 +1,52 @@
+openapi: 3.0.3
+info: {title: DuoPay Synthetic API, version: '1'}
+servers:
+  - url: https://duopay.example/v1
+paths:
+  /card/payouts:
+    post:
+      operationId: createCardPayout
+      summary: Create card payout
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [amount, card_number]
+              properties:
+                amount: {type: integer, minimum: 1, description: Amount in cents}
+                card_number: {type: string}
+      responses:
+        '201':
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [id, status]
+                properties:
+                  id: {type: string}
+                  status: {type: string, enum: [pending, completed, failed]}
+  /sbp/payouts:
+    post:
+      operationId: createSbpPayout
+      summary: Create SBP payout
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [amount, phone, bank_code]
+              properties:
+                amount: {type: integer, minimum: 1, description: Amount in cents}
+                phone: {type: string}
+                bank_code: {type: string}
+      responses:
+        '201':
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [id, status]
+                properties:
+                  id: {type: string}
+                  status: {type: string, enum: [pending, completed, failed]}

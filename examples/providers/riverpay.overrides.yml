@@ -1,0 +1,36 @@
+amount: {unit: major, factor: 1}
+operations:
+  initiateTransfer: create
+  inspectTransfer: status
+  transferNotification: webhook
+field_mappings:
+  initiateTransfer:
+    funds.value: amount
+    funds.denomination: currency
+    reference: external_id
+    beneficiary.kind: recipient.type
+    beneficiary.pan: recipient.card_number
+  inspectTransfer:
+    transfer_reference: provider_operation_id
+  transferNotification:
+    transfer_reference: provider_operation_id
+    phase: status
+response_mappings:
+  initiateTransfer: {provider_operation_id: transfer_reference, status: phase}
+  inspectTransfer: {provider_operation_id: transfer_reference, status: phase}
+status_mappings:
+  queued: in_progress
+  settled: approved
+  declined: rejected
+signature:
+  algorithm: HMAC-SHA256
+  header: X-River-Digest
+  signed_data: raw_body
+  encoding: base64
+auth:
+  BearerToken: {credential: access_token}
+idempotency:
+  initiateTransfer: {name: X-Request-Token, in: header}
+request_methods:
+  card_transfer: create
+  transfer_state: status

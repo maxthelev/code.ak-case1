@@ -1,0 +1,99 @@
+openapi: 3.0.3
+info:
+  title: RiverPay Transfer API
+  version: 2.0.0
+servers:
+  - url: https://sandbox.riverpay.example/api/v2
+security:
+  - BearerToken: []
+paths:
+  /transfers:
+    post:
+      operationId: initiateTransfer
+      summary: Create a bank transfer
+      description: Transfer amount is expressed in major currency units.
+      parameters:
+        - name: X-Request-Token
+          in: header
+          description: Idempotency key
+          schema: {type: string}
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [funds, reference, beneficiary]
+              properties:
+                funds:
+                  type: object
+                  required: [value, denomination]
+                  properties:
+                    value: {type: number, minimum: 2.5, description: Amount in major currency units}
+                    denomination: {type: string, enum: [EUR, USD]}
+                reference: {type: string, maxLength: 80}
+                beneficiary:
+                  type: object
+                  required: [kind, pan]
+                  properties:
+                    kind: {type: string, enum: [card]}
+                    pan: {type: string, pattern: '^[0-9]{16}$'}
+            example:
+              funds: {value: 25.75, denomination: EUR}
+              reference: demo-transfer-1
+              beneficiary: {kind: card, pan: '4111111111111111'}
+      responses:
+        '202':
+          description: Accepted
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Transfer'}
+              example: {transfer_reference: rp-demo-1, phase: queued}
+        '401': {description: Invalid bearer token}
+        '429': {description: Rate limited}
+  /transfers/{transfer_reference}:
+    get:
+      operationId: inspectTransfer
+      summary: Get transfer status
+      parameters:
+        - name: transfer_reference
+          in: path
+          required: true
+          schema: {type: string}
+      responses:
+        '200':
+          description: Transfer state
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Transfer'}
+              example: {transfer_reference: rp-demo-1, phase: settled}
+  /notifications/transfer:
+    post:
+      operationId: transferNotification
+      summary: Incoming webhook
+      description: HMAC-SHA256 signature of the raw HTTP body in X-River-Digest.
+      security: []
+      parameters:
+        - name: X-River-Digest
+          in: header
+          required: true
+          description: HMAC-SHA256 signature
+          schema: {type: string}
+      requestBody:
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/Transfer'}
+            examples:
+              settled: {value: {transfer_reference: rp-demo-1, phase: settled}}
+              declined: {value: {transfer_reference: rp-demo-1, phase: declined}}
+      responses:
+        '204': {description: Received}
+components:
+  securitySchemes:
+    BearerToken: {type: http, scheme: bearer}
+  schemas:
+    Transfer:
+      type: object
+      required: [transfer_reference, phase]
+      properties:
+        transfer_reference: {type: string}
+        phase: {type: string, enum: [queued, settled, declined]}

@@ -1,0 +1,430 @@
+openapi: 3.0.3
+info:
+  title: NovaPay Payout API
+  description: |
+    Mock API платёжного провайдера NovaPay для хакатона Space Payments.
+    Поддерживает создание выплат через СБП, проверку статуса и webhook-уведомления.
+  version: 1.0.0
+  contact:
+    name: NovaPay Integration Team
+    email: integration@novapay.example
+
+servers:
+  - url: https://api.sandbox.novapay.example/v1
+    description: Sandbox
+  - url: https://api.novapay.example/v1
+    description: Production
+
+tags:
+  - name: Payouts
+    description: Операции выплат
+  - name: Webhooks
+    description: Уведомления о смене статуса
+
+paths:
+  /payouts:
+    post:
+      tags: [Payouts]
+      summary: Создать выплату
+      description: |
+        Создаёт новую выплату на счёт получателя через СБП.
+        Сумма передаётся в копейках. Минимальная сумма — 1000 RUB (100000 коп.).
+      operationId: createPayout
+      security:
+        - ApiKeyAuth: []
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreatePayoutRequest'
+            examples:
+              sbp_payout:
+                summary: Выплата через СБП
+                value:
+                  amount: 1500000
+                  currency: RUB
+                  external_id: "op_abc123"
+                  recipient:
+                    type: sbp
+                    phone: "79001234567"
+                    bank_code: "044525225"
+                    bank_name: "Сбербанк"
+      responses:
+        '201':
+          description: Выплата создана
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PayoutResponse'
+              example:
+                id: "np_7f3a9b2c"
+                external_id: "op_abc123"
+                status: pending
+                amount: 1500000
+                currency: RUB
+                created_at: "2026-07-30T10:00:00Z"
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '402':
+          description: Недостаточно средств на балансе провайдера
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+              example:
+                error:
+                  code: insufficient_balance
+                  message: "Insufficient provider balance"
+        '409':
+          description: Дубликат по idempotency key
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PayoutResponse'
+        '422':
+          description: Ошибка валидации
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+              example:
+                error:
+                  code: validation_error
+                  message: "Amount must be at least 100000 kopecks"
+                  details:
+                    - field: amount
+                      message: "minimum is 100000"
+        '429':
+          $ref: '#/components/responses/RateLimited'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /payouts/{payout_id}:
+    get:
+      tags: [Payouts]
+      summary: Получить статус выплаты
+      operationId: getPayoutStatus
+      security:
+        - ApiKeyAuth: []
+      parameters:
+        - name: payout_id
+          in: path
+          required: true
+          schema:
+            type: string
+          example: "np_7f3a9b2c"
+      responses:
+        '200':
+          description: Статус выплаты
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PayoutResponse'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          description: Выплата не найдена
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+              example:
+                error:
+                  code: not_found
+                  message: "Payout not found"
+
+  /payouts/{payout_id}/cancel:
+    post:
+      tags: [Payouts]
+      summary: Отменить выплату
+      description: Отмена возможна только в статусах pending и processing
+      operationId: cancelPayout
+      security:
+        - ApiKeyAuth: []
+      parameters:
+        - name: payout_id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Выплата отменена
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PayoutResponse'
+        '409':
+          description: Невозможно отменить в текущем статусе
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+              example:
+                error:
+                  code: invalid_status
+                  message: "Cannot cancel payout in status completed"
+
+  /webhooks/payout:
+    post:
+      tags: [Webhooks]
+      summary: Webhook уведомление о смене статуса
+      description: |
+        NovaPay отправляет POST-запрос на URL, указанный при регистрации.
+        Подпись передаётся в заголовке X-NovaPay-Signature (HMAC-SHA256).
+      operationId: payoutWebhook
+      security: []
+      parameters:
+        - name: X-NovaPay-Signature
+          in: header
+          required: true
+          schema:
+            type: string
+          description: HMAC-SHA256 подпись тела запроса
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/WebhookPayload'
+            examples:
+              completed:
+                summary: Выплата завершена
+                value:
+                  event: payout.completed
+                  payout_id: "np_7f3a9b2c"
+                  external_id: "op_abc123"
+                  status: completed
+                  completed_at: "2026-07-30T10:05:00Z"
+              failed:
+                summary: Выплата отклонена
+                value:
+                  event: payout.failed
+                  payout_id: "np_7f3a9b2c"
+                  external_id: "op_abc123"
+                  status: failed
+                  error:
+                    code: recipient_not_found
+                    message: "Recipient account not found"
+      responses:
+        '200':
+          description: Webhook принят
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  received:
+                    type: boolean
+                    example: true
+
+  /balance:
+    get:
+      tags: [Payouts]
+      summary: Баланс провайдера
+      operationId: getBalance
+      security:
+        - ApiKeyAuth: []
+      responses:
+        '200':
+          description: Текущий баланс
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  balance:
+                    type: integer
+                    description: Баланс в копейках
+                    example: 500000000
+                  currency:
+                    type: string
+                    example: RUB
+                  hold:
+                    type: integer
+                    description: Замороженная сумма
+                    example: 15000000
+
+components:
+  securitySchemes:
+    ApiKeyAuth:
+      type: apiKey
+      in: header
+      name: X-API-Key
+      description: API-ключ, выдаётся при подключении
+
+  parameters:
+    IdempotencyKey:
+      name: Idempotency-Key
+      in: header
+      required: false
+      schema:
+        type: string
+        format: uuid
+      description: Ключ идемпотентности для предотвращения дублей
+
+  schemas:
+    CreatePayoutRequest:
+      type: object
+      required: [amount, currency, external_id, recipient]
+      properties:
+        amount:
+          type: integer
+          description: Сумма в копейках
+          minimum: 100000
+          example: 1500000
+        currency:
+          type: string
+          enum: [RUB]
+          example: RUB
+        external_id:
+          type: string
+          description: ID операции на стороне мерчанта
+          maxLength: 64
+          example: "op_abc123"
+        recipient:
+          $ref: '#/components/schemas/Recipient'
+
+    Recipient:
+      type: object
+      required: [type, phone]
+      properties:
+        type:
+          type: string
+          enum: [sbp, card]
+          example: sbp
+        phone:
+          type: string
+          pattern: '^7\d{10}$'
+          description: Телефон получателя (11 цифр, начинается с 7)
+          example: "79001234567"
+        bank_code:
+          type: string
+          description: БИК банка (обязателен для type=sbp)
+          example: "044525225"
+        bank_name:
+          type: string
+          example: "Сбербанк"
+        card_number:
+          type: string
+          description: Номер карты (обязателен для type=card)
+          example: "4111111111111111"
+
+    PayoutResponse:
+      type: object
+      properties:
+        id:
+          type: string
+          example: "np_7f3a9b2c"
+        external_id:
+          type: string
+          example: "op_abc123"
+        status:
+          type: string
+          enum: [pending, processing, completed, failed, cancelled]
+        amount:
+          type: integer
+          example: 1500000
+        currency:
+          type: string
+          example: RUB
+        recipient:
+          $ref: '#/components/schemas/Recipient'
+        error:
+          $ref: '#/components/schemas/PayoutError'
+        created_at:
+          type: string
+          format: date-time
+        completed_at:
+          type: string
+          format: date-time
+
+    PayoutError:
+      type: object
+      properties:
+        code:
+          type: string
+          enum:
+            - validation_error
+            - insufficient_balance
+            - recipient_not_found
+            - bank_unavailable
+            - amount_limit_exceeded
+            - rate_limit_exceeded
+            - internal_error
+        message:
+          type: string
+
+    WebhookPayload:
+      type: object
+      required: [event, payout_id, status]
+      properties:
+        event:
+          type: string
+          enum:
+            - payout.completed
+            - payout.failed
+            - payout.processing
+            - payout.cancelled
+        payout_id:
+          type: string
+        external_id:
+          type: string
+        status:
+          type: string
+          enum: [pending, processing, completed, failed, cancelled]
+        completed_at:
+          type: string
+          format: date-time
+        error:
+          $ref: '#/components/schemas/PayoutError'
+
+    ErrorResponse:
+      type: object
+      properties:
+        error:
+          $ref: '#/components/schemas/PayoutError'
+
+  responses:
+    BadRequest:
+      description: Некорректный запрос
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+    Unauthorized:
+      description: Невалидный API-ключ
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+          example:
+            error:
+              code: unauthorized
+              message: "Invalid API key"
+    RateLimited:
+      description: Превышен лимит запросов
+      headers:
+        Retry-After:
+          schema:
+            type: integer
+          description: Секунд до повторной попытки
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+          example:
+            error:
+              code: rate_limit_exceeded
+              message: "Rate limit exceeded, retry after 60 seconds"
+    InternalError:
+      description: Внутренняя ошибка провайдера
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'

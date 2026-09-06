@@ -1,0 +1,77 @@
+:root {
+  color-scheme: light;
+  --paper: #ffffff;
+  --ink: #24292f;
+  --muted: #57606a;
+  --line: #d8dee4;
+  --soft: #f6f8fa;
+  --link: #0969da;
+  font: 16px/1.65 system-ui, -apple-system, "Segoe UI", sans-serif;
+  color: var(--ink);
+  background: var(--paper);
+}
+* { box-sizing: border-box; }
+body { margin: 0; }
+.page-header, nav, main, footer { width: min(100% - 48px, 960px); margin-inline: auto; }
+.page-header { padding-block: 32px 24px; }
+.team-mark { display: flex; align-items: center; gap: 10px; margin-bottom: 32px; }
+.team-logo { display: block; flex-shrink: 0; }
+.wordmark { font-size: 23px; font-weight: 750; letter-spacing: -.06em; line-height: 1.2; }
+.wordmark span { font-weight: 450; }
+.team-caption { display: block; font-size: 11px; color: var(--muted); letter-spacing: .04em; margin-top: 4px; }
+.eyebrow { color: var(--muted); font-size: 13px; margin: 0 0 12px; }
+h1 { font-size: 30px; line-height: 1.25; letter-spacing: -.025em; margin: 0 0 12px; overflow-wrap: anywhere; }
+.summary { margin: 0; color: var(--muted); }
+nav { display: flex; flex-wrap: wrap; gap: 6px 22px; padding-block: 16px; border-block: 1px solid var(--line); font-size: 14px; }
+a { color: var(--link); text-underline-offset: 4px; }
+nav a { color: var(--muted); text-decoration: none; }
+nav a:hover { color: var(--link); text-decoration: underline; }
+section { padding-block: 32px; border-bottom: 1px solid var(--line); scroll-margin-top: 24px; }
+h2 { font-size: 23px; line-height: 1.3; letter-spacing: -.015em; margin: 0 0 20px; }
+h3 { font-size: 17px; font-weight: 600; margin: 24px 0 12px; overflow-wrap: anywhere; }
+p { margin: 12px 0; overflow-wrap: anywhere; }
+ul { padding-left: 22px; }
+li + li { margin-top: 6px; }
+.muted { color: var(--muted); font-size: 14px; }
+code { font: .88em/1.6 ui-monospace, SFMono-Regular, Consolas, "Liberation Mono", monospace; }
+.connection { display: grid; grid-template-columns: minmax(140px, 1fr) 3fr; gap: 12px 24px; margin: 0 0 18px; }
+dt { color: var(--muted); }
+dd { margin: 0; min-width: 0; overflow-wrap: anywhere; }
+.endpoints { padding: 0; margin: 0; list-style: none; }
+.endpoints li { display: grid; grid-template-columns: 110px minmax(0, 1fr); gap: 16px; padding-block: 9px; margin: 0; }
+.endpoints span { color: var(--muted); font-size: 14px; }
+.endpoints code { overflow-wrap: anywhere; }
+.status-map { list-style: none; margin: 0; padding: 0; }
+.status-map li { display: grid; grid-template-columns: minmax(100px, 180px) 24px minmax(100px, 1fr); gap: 14px; }
+.status-map code { overflow-wrap: anywhere; }
+.status-map span { color: var(--muted); }
+.table-scroll { overflow-x: auto; margin-block: 14px; }
+table { width: 100%; border-collapse: collapse; text-align: left; font-size: 14px; }
+th { color: var(--muted); background: var(--soft); font-weight: 500; }
+th, td { padding: 9px 12px; border-bottom: 1px solid var(--line); vertical-align: top; }
+td code { white-space: nowrap; }
+details { margin-block: 20px; }
+summary { cursor: pointer; width: fit-content; color: var(--link); font-size: 14px; }
+pre { background: var(--soft); border: 1px solid var(--line); padding: 20px; overflow-x: auto; font-size: 14px; }
+pre code { font-size: inherit; }
+footer { padding-block: 24px 40px; font-size: 13px; color: var(--muted); }
+footer ul { display: flex; flex-wrap: wrap; list-style: none; padding: 0; gap: 8px 20px; }
+footer li + li { margin: 0; }
+:focus-visible { outline: 2px solid var(--link); outline-offset: 4px; }
+.skip-link { position: absolute; left: 24px; top: -60px; background: var(--paper); padding: 8px; }
+.skip-link:focus { top: 8px; }
+@media (max-width: 600px) {
+  .page-header, nav, main, footer { width: calc(100% - 32px); }
+  .page-header { padding-top: 32px; }
+  h1 { font-size: 30px; }
+  section { padding-block: 26px; }
+  .connection { grid-template-columns: 1fr; gap: 4px; }
+  dd { margin-bottom: 12px; }
+  .endpoints li { grid-template-columns: 70px minmax(0, 1fr); gap: 12px; }
+  pre { padding: 14px; }
+}
+@media print {
+  :root { --paper: white; --ink: black; --muted: #444; --line: #ccc; --soft: white; }
+  nav, .skip-link { display: none; }
+  section { break-inside: avoid; }
+}

@@ -1,0 +1,676 @@
+# frozen_string_literal: true
+
+require 'json'
+require 'bigdecimal'
+require 'openssl'
+require 'base64'
+require 'uri'
+require 'timeout'
+require 'date'
+
+class Provider::<%= class_name %> < Provider::BaseService
+  CONFIG = JSON.parse(<%= config_literal %>).freeze
+  STATUS_MAP = CONFIG.fetch('status_mappings', {}).freeze
+  ENV_PREFIX = CONFIG.fetch('provider').upcase.freeze
+  MAX_CALLBACK_BYTES = 1024 * 1024
+  MAX_RESPONSE_BYTES = 4 * 1024 * 1024
+  HTTP_FAILURE_CODES = {
+    400 => :bad_request, 401 => :unauthorized, 402 => :payment_required,
+    403 => :forbidden, 404 => :not_found, 409 => :conflict,
+    422 => :unprocessable_entity, 429 => :too_many_requests,
+    500 => :internal_server_error, 502 => :bad_gateway,
+    503 => :service_unavailable, 504 => :gateway_timeout
+  }.freeze
+  FAILURE_CODES = {
+    configuration_error: :internal_server_error, invalid_signature: :unauthorized,
+    invalid_response: :bad_gateway, response_too_large: :bad_gateway,
+    transport_error: :service_unavailable
+  }.freeze
+
+  class InputError < StandardError
+    attr_reader :code
+
+    def initialize(message, code = :unprocessable_entity)
+      @code = code
+      super(message)
+    end
+  end
+
+  # проверяем можно ли собрать выплату до обращения к провайдеру
+  def check_conditions(operation, request_method)
+    base_result = super
+    return base_result if base_result.failed?
+
+    validate_configuration!
+    endpoint = endpoint_for(request_method)
+    build_payload(endpoint, operation)
+    success
+  rescue InputError => error
+    platform_failure(error.code, error.message)
+  end
+
+  # собираем и отправляем запрос а http-метод берём из настроек endpoint
+  def create_request(operation, request_method = 'create')
+    conditions = check_conditions(operation, request_method)
+    return conditions if conditions.failed?
+
+    endpoint = endpoint_for(request_method)
+    payload = build_payload(endpoint, operation)
+    url, headers = request_options(endpoint, operation)
+    response = dispatch(endpoint.fetch('method'), url, payload, headers)
+    parse_response(endpoint, response)
+  rescue InputError => error
+    platform_failure(error.code, error.message)
+  rescue JSON::ParserError
+    platform_failure(:invalid_response, 'Provider returned invalid JSON')
+  rescue Timeout::Error, IOError, SystemCallError
+    platform_failure(:transport_error, 'Provider transport failed; reconcile status before retrying')
+  end
+
+  # спрашиваем текущий статус без обязательных полей создания выплаты
+  def fetch_status(operation)
+    create_request(operation, logical_method('status'))
+  end
+
+  def cancel_request(operation)
+    create_request(operation, logical_method('cancel'))
+  end
+
+  def fetch_balance(operation = nil)
+    create_request(operation, logical_method('balance'))
+  end
+
+  # хост вызывает проверку до json.parse и сохраняет исходные байты body
+  def verify_callback_signature(raw_body, headers)
+    validate_configuration!
+    raise InputError, 'Original raw_body must be a string' unless raw_body.is_a?(String)
+    raise InputError, 'Callback headers must be an object' unless headers.is_a?(Hash)
+    raise InputError, 'Callback body exceeds the size limit' if raw_body.bytesize > MAX_CALLBACK_BYTES
+
+    verify_signature!(raw_body, headers)
+    success
+  rescue InputError => error
+    platform_failure(error.code, error.message)
+  end
+
+  # здесь уже разобранный json а проверка подписи остаётся на http-границе
+  def process_callback(payload)
+    validate_configuration!
+    endpoint = CONFIG.fetch('operations').find { |item| item['role'] == 'webhook' }
+    raise InputError.new('Webhook endpoint is not configured', :configuration_error) unless endpoint
+    raise InputError, 'Callback payload must be a parsed JSON object' unless payload.is_a?(Hash)
+
+    validate_json_data!(payload, limit: MAX_CALLBACK_BYTES, label: 'Callback')
+    validate_schema!(payload, endpoint.dig('request', 'schema') || {}, 'callback')
+    mappings = endpoint.fetch('field_mappings', {}).invert
+    data = mapped_response(payload, mappings)
+    events = endpoint.fetch('events', [])
+    if mappings.key?('event') && !events.empty? && !events.include?(data['event'])
+      raise InputError.new('Callback event is not configured', :unknown_event)
+    end
+    raise InputError.new('Callback operation id is missing', :invalid_callback) if blank?(data['provider_operation_id'])
+
+    data['status'] = canonical_status(data['status'], :invalid_callback)
+    result = case data['status']
+             when 'approved' then approve_operation(data['provider_operation_id'])
+             when 'rejected' then reject_operation(data['provider_operation_id'], data.dig('error', 'code'))
+             end
+    return result if result.respond_to?(:failed?) && result.failed?
+
+    success(data)
+  rescue InputError => error
+    platform_failure(error.code, error.message)
+  end
+
+  private
+
+  def platform_failure(code, message)
+    failure(FAILURE_CODES.fetch(code, :unprocessable_entity), message)
+  end
+
+  # hash приходит от хоста поэтому ограничиваем и неизвестные схеме поля без рекурсии
+  def validate_json_data!(payload, limit:, label:)
+    pending = [[payload, 0]]
+    nodes = 0
+    bytes = 0
+    until pending.empty?
+      value, depth = pending.pop
+      nodes += 1
+      raise InputError, "#{label} nesting or node count exceeds the limit" if depth > 100 || nodes > 100_000
+      case value
+      when Hash
+        raise InputError, "#{label} object has too many fields" if value.size > 100_000
+        value.each do |key, child|
+          raise InputError, "#{label} JSON keys must be strings" unless key.is_a?(String)
+          bytes += key.bytesize + 3
+          raise InputError, "#{label} data exceeds the size limit" if bytes > limit
+          raise InputError, "#{label} JSON key has invalid encoding" unless valid_utf8?(key)
+          pending << [child, depth + 1]
+        end
+      when Array
+        raise InputError, "#{label} array has too many items" if value.size > 100_000
+        value.each { |child| pending << [child, depth + 1] }
+      when String
+        bytes += value.bytesize
+        raise InputError, "#{label} data exceeds the size limit" if bytes > limit
+        raise InputError, "#{label} string has invalid encoding" unless valid_utf8?(value)
+      when Integer, Float, BigDecimal
+        decimal(value)
+        bytes += value.to_s.bytesize
+      when true, false, nil
+        bytes += 5
+      else
+        raise InputError, "#{label} contains a value that is not JSON"
+      end
+      bytes += 2
+      raise InputError, "#{label} data exceeds the size limit" if bytes > limit || pending.size > 100_000
+    end
+  end
+
+  def valid_utf8?(value)
+    value.encoding.ascii_compatible? && value.dup.force_encoding(Encoding::UTF_8).valid_encoding?
+  end
+
+  # не отправляем запросы если при генерации остались критичные вопросы
+  def validate_configuration!
+    unresolved = CONFIG.fetch('diagnostics', []).find { |item| %w[error critical].include?(item['severity']) }
+    return unless unresolved
+
+    raise InputError.new("Unresolved integration configuration: #{unresolved['code']}; #{unresolved['message']}", :configuration_error)
+  end
+
+  def logical_method(role)
+    CONFIG.fetch('request_methods', {}).key(role) || role
+  end
+
+  # логический request_method должен однозначно выбрать один endpoint
+  def endpoint_for(request_method)
+    target = CONFIG.fetch('request_methods', {})[request_method.to_s]
+    raise InputError.new("Unsupported logical request method: #{request_method}", :unsupported_request_method) unless target
+
+    endpoints = CONFIG.fetch('operations').select do |item|
+      item['role'] != 'webhook' && (target.is_a?(Hash) ? item['id'] == target['operationId'] : item['role'] == target)
+    end
+    raise InputError.new("Expected one endpoint for #{request_method}; configure request_methods", :configuration_error) unless endpoints.size == 1
+
+    endpoints.first
+  end
+
+  # собираем json из operation и проверяем обязательные поля вместе с required_if
+  def build_payload(endpoint, operation)
+    schema = endpoint.dig('request', 'schema')
+    return nil unless schema
+
+    payload = build_object(schema, '', endpoint.fetch('field_mappings', {}), operation)
+    validate_schema!(payload, schema, 'request')
+    CONFIG.fetch('required_if', []).each do |rule|
+      next unless schema_at(schema, rule['field'])
+      next unless value_at(payload, rule.dig('when', 'field')) == rule.dig('when', 'value')
+      raise InputError, "#{rule['field']} is required when #{rule.dig('when', 'field')}=#{rule.dig('when', 'value')}" if blank?(value_at(payload, rule['field']))
+    end
+    payload
+  end
+
+  def schema_at(schema, path)
+    path.to_s.split('.').reduce(schema) do |current, key|
+      break nil unless current.is_a?(Hash)
+      current.dig('properties', key)
+    end
+  end
+
+  # идём по схеме рекурсивно а defaults уже считаем значениями в единицах провайдера
+  def build_object(schema, prefix, mappings, operation)
+    schema.fetch('properties', {}).each_with_object({}) do |(name, field), result|
+      path = [prefix, name].reject(&:empty?).join('.')
+      if field['type'] == 'object' || field.key?('properties')
+        value = build_object(field, path, mappings, operation)
+        value = field['default'].merge(value) if field['default'].is_a?(Hash)
+        value = nil if value.empty? && !schema.fetch('required', []).include?(name)
+      else
+        canonical = mappings[path]
+        value = canonical_value(operation, canonical) if canonical
+        value = converted_amount(value, field) if canonical == 'amount' && !value.nil?
+        value = field['default'] if value.nil? && field.key?('default')
+        value = field['enum'].first if value.nil? && field['enum']&.size == 1
+      end
+      result[name] = value unless value.nil?
+    end
+  end
+
+  # provider_operation_id остаётся именем в ir а host хранит его в provider_operation_key
+  def canonical_value(operation, field)
+    return nil unless operation
+    return payout_requisite_value(operation, field.delete_prefix('recipient.')) if field.start_with?('recipient.')
+
+    name = {'external_id' => 'id', 'provider_operation_id' => 'provider_operation_key'}[field] || field
+    return value_at(operation, name) if operation.is_a?(Hash)
+    operation.public_send(name) if %w[id amount currency provider_operation_key].include?(name) && operation.respond_to?(name)
+  end
+
+  # выбираем известную форму реквизитов а конфликтующие значения не угадываем
+  def payout_requisite_value(operation, name)
+    requisite = operation.is_a?(Hash) ? value_at(operation, 'payout_requisite') : operation.payout_requisite
+    return nil if requisite.nil?
+    raise InputError, 'Payout requisite must be an object' unless requisite.is_a?(Hash)
+    %w[sbp card].each do |branch|
+      value = value_at(requisite, branch)
+      raise InputError, "Payout requisite #{branch} must be an object" unless value.nil? || value.is_a?(Hash)
+    end
+    cards = %w[card_number card.number card.card_number].map { |path| value_at(requisite, path) }.reject { |value| blank?(value) }.uniq
+    raise InputError, 'Conflicting card numbers in payout requisite' if cards.size > 1
+    sbp = !blank?(value_at(requisite, 'sbp')) || !blank?(value_at(requisite, 'bank_code'))
+    card = !cards.empty?
+    type = value_at(requisite, 'type')
+    if blank?(type)
+      raise InputError, 'Ambiguous payout requisite: select type' if sbp && card
+      type = sbp ? 'sbp' : ('card' if card)
+    elsif !%w[sbp card].include?(type) || (type == 'sbp' && card && !sbp) || (type == 'card' && sbp && !card)
+      raise InputError, 'Payout requisite type conflicts with its data'
+    end
+    return type if name == 'type'
+    return cards.first if name == 'card_number' && type == 'card'
+    return nil unless %w[phone bank_code bank_name].include?(name)
+    return nil if type == 'card' && name != 'phone'
+
+    values = [value_at(requisite, name), (value_at(requisite, "sbp.#{name}") if type == 'sbp')].reject { |value| blank?(value) }.uniq
+    raise InputError, "Conflicting #{name} in payout requisite" if values.size > 1
+    values.first
+  end
+
+  # меняем единицы через BigDecimal и отклоняем сумму если понадобится округление
+  def converted_amount(value, schema)
+    factor = CONFIG.dig('amount', 'factor')
+    raise InputError.new('Amount factor is unresolved; configure amount override', :configuration_error) unless factor
+
+    converted = decimal(value) * decimal(factor)
+    raise InputError, 'Amount is outside the supported numeric range' unless converted.finite? && converted.exponent.abs <= 308
+    if schema['type'] == 'integer'
+      raise InputError, 'Amount contains fractional minor units; rounding is not allowed' unless converted.frac.zero?
+      converted.to_i
+    elsif schema['type'] == 'string'
+      converted.to_s('F')
+    else
+      number = converted.to_f
+      raise InputError, 'Amount cannot be represented exactly as a JSON number' unless number.finite? && BigDecimal(number.to_s) == converted
+      converted.frac.zero? ? converted.to_i : number
+    end
+  rescue ArgumentError
+    raise InputError, 'Amount must be a decimal number'
+  end
+
+  # ограничиваем длину и exponent чтобы короткая запись не раздулась в огромное число
+  def decimal(value)
+    text = value.to_s
+    raise InputError, 'Decimal input exceeds the size limit' if text.bytesize > 1024
+    number = BigDecimal(text)
+    unless number.finite? && number.exponent.abs <= 308
+      raise InputError, 'Decimal is outside the supported numeric range'
+    end
+    number
+  end
+
+  # читаем числа без потери точности и не принимаем повторные ключи
+  def parse_json(text)
+    utf8 = text.dup.force_encoding(Encoding::UTF_8)
+    raise JSON::ParserError, 'Invalid UTF-8' unless utf8.valid_encoding?
+    JSON.parse(utf8, decimal_class: BigDecimal, allow_duplicate_key: false)
+  end
+
+  # проверяем вложенные значения по тем ограничениям которые сохранились в конфигурации
+  def validate_schema!(value, schema, path)
+    return if value.nil? && (schema['nullable'] || Array(schema['type']).include?('null'))
+
+    type = schema['type'] || ('object' if schema.key?('properties'))
+    valid = case type
+            when 'object' then value.is_a?(Hash)
+            when 'array' then value.is_a?(Array)
+            when 'string' then value.is_a?(String)
+            when 'integer' then value.is_a?(Integer)
+            when 'number' then value.is_a?(Numeric)
+            when 'boolean' then value == true || value == false
+            when 'null' then value.nil?
+            else true
+            end
+    raise InputError, "#{path} must be #{type}" unless valid
+    raise InputError, "#{path} is outside the allowed enum" if schema['enum'] && !schema['enum'].include?(value)
+
+    if value.is_a?(Hash)
+      schema.fetch('required', []).each do |name|
+        raise InputError, "#{path}.#{name} is required" unless value.key?(name)
+      end
+      schema.fetch('properties', {}).each do |name, child|
+        validate_schema!(value[name], child, "#{path}.#{name}") if value.key?(name)
+      end
+    elsif value.is_a?(Array)
+      raise InputError, "#{path} has too few items" if schema['minItems'] && value.size < schema['minItems']
+      raise InputError, "#{path} has too many items" if schema['maxItems'] && value.size > schema['maxItems']
+      raise InputError, "#{path} items must be unique" if schema['uniqueItems'] && value.uniq.size != value.size
+      value.each_with_index { |item, index| validate_schema!(item, schema.fetch('items', {}), "#{path}[#{index}]") }
+    elsif value.is_a?(String)
+      raise InputError, "#{path} is too short" if schema['minLength'] && value.length < schema['minLength']
+      raise InputError, "#{path} is too long" if schema['maxLength'] && value.length > schema['maxLength']
+      raise InputError, "#{path} does not match pattern" if schema['pattern'] && !matches_pattern?(schema['pattern'], value)
+      validate_format!(value, schema['format'], path)
+    elsif value.is_a?(Numeric)
+      raise InputError, "#{path} must be a finite number within the supported range" unless value.to_f.finite?
+      raise InputError, "#{path} is below minimum #{schema['minimum']}" if schema['minimum'] && value < schema['minimum']
+      raise InputError, "#{path} exceeds maximum #{schema['maximum']}" if schema['maximum'] && value > schema['maximum']
+      minimum = schema['exclusiveMinimum'] == true ? schema['minimum'] : schema['exclusiveMinimum']
+      maximum = schema['exclusiveMaximum'] == true ? schema['maximum'] : schema['exclusiveMaximum']
+      raise InputError, "#{path} must exceed #{minimum}" if minimum.is_a?(Numeric) && value <= minimum
+      raise InputError, "#{path} must be below #{maximum}" if maximum.is_a?(Numeric) && value >= maximum
+      if schema['multipleOf'] && !(BigDecimal(value.to_s) % BigDecimal(schema['multipleOf'].to_s)).zero?
+        raise InputError, "#{path} must be a multiple of #{schema['multipleOf']}"
+      end
+    end
+  rescue RegexpError, Regexp::TimeoutError
+    raise InputError.new("#{path} contains an unsupported pattern", :configuration_error)
+  end
+
+  # якоря openapi относятся ко всей строке а не к отдельным строкам внутри неё
+  def matches_pattern?(pattern, value)
+    pattern = "\\A#{pattern[1..]}" if pattern.start_with?('^')
+    pattern = "#{pattern[0...-1]}\\z" if pattern.end_with?('$') && !pattern.end_with?('\\$')
+    Regexp.new(pattern, timeout: 0.1).match?(value)
+  end
+
+  def validate_format!(value, format, path)
+    valid = case format
+            when 'uuid' then /\A[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\z/i.match?(value)
+            when 'date' then /\A\d{4}-\d{2}-\d{2}\z/.match?(value) && Date.iso8601(value)
+            when 'date-time'
+              /\A\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})\z/i.match?(value) && DateTime.iso8601(value)
+            else true
+            end
+    raise InputError, "#{path} has invalid #{format} format" unless valid
+  rescue Date::Error
+    raise InputError, "#{path} has invalid #{format} format"
+  end
+
+  # собираем path query headers auth и ключ повтора в один запрос
+  def request_options(endpoint, operation)
+    server = (endpoint['servers'] || []).first || CONFIG.fetch('servers', []).first || {}
+    configured = base_url || ENV["#{ENV_PREFIX}_BASE_URL"] || server['url']
+    raise InputError.new('Provider base URL is missing', :configuration_error) if blank?(configured)
+    raise InputError.new('Provider base URL must be a string', :configuration_error) unless configured.is_a?(String)
+    uri = URI.parse(configured)
+    raise InputError.new('Provider base URL must use HTTP(S)', :configuration_error) unless %w[https http].include?(uri.scheme) && uri.host
+    if uri.userinfo || uri.query || uri.fragment
+      raise InputError.new('Provider base URL must not contain userinfo, query or fragment', :configuration_error)
+    end
+
+    path = endpoint.fetch('path').dup
+    headers = { 'Accept' => endpoint['response_media_type'] || 'application/json' }
+    headers['Content-Type'] = endpoint['request_media_type'] || 'application/json' if endpoint.dig('request', 'schema')
+    query = []
+    endpoint.fetch('parameters', []).each do |parameter|
+      name = parameter.fetch('name')
+      next if endpoint.dig('idempotency', 'name') == name
+      next if auth_parameter?(endpoint, parameter)
+
+      field = endpoint.fetch('field_mappings', {})[name] || name
+      value = canonical_value(operation, field)
+      value = converted_amount(value, parameter.fetch('schema', {})) if field == 'amount' && !value.nil?
+      value = parameter.dig('schema', 'default') if value.nil?
+      values = parameter.dig('schema', 'enum')
+      value = values.first if value.nil? && values&.size == 1
+      raise InputError, "Parameter #{name} is required" if blank?(value) && parameter['required']
+      next if value.nil?
+
+      validate_schema!(value, parameter.fetch('schema', {}), name)
+      case parameter['in']
+      when 'path'
+        raise InputError, 'Path parameter must not be a dot segment' if %w[. ..].include?(value.to_s)
+        path.gsub!("{#{name}}", URI.encode_www_form_component(value.to_s).gsub('+', '%20'))
+      when 'query' then query << [name, value]
+      when 'header' then headers[name] = value.to_s
+      else raise InputError.new("Unsupported parameter location #{parameter['in']}", :configuration_error)
+      end
+    end
+    raise InputError, 'Path parameters are unresolved' if path.match?(/\{[^}]+\}/)
+    apply_auth!(endpoint, headers, query)
+    apply_idempotency!(endpoint, operation, headers, query)
+    headers.each do |name, value|
+      unless /\A[!#$%&'*+.^_`|~0-9A-Za-z-]+\z/.match?(name) && !value.to_s.match?(/[\r\n]/)
+        raise InputError, 'Request header contains invalid characters'
+      end
+    end
+    url = configured.sub(%r{/\z}, '') + '/' + path.sub(%r{\A/}, '')
+    url += "?#{URI.encode_www_form(query)}" unless query.empty?
+    [url, headers]
+  rescue URI::InvalidURIError
+    raise InputError.new('Provider base URL is invalid', :configuration_error)
+  end
+
+  def auth_parameter?(endpoint, parameter)
+    endpoint.fetch('security', []).any? do |alternative|
+      alternative.keys.any? do |name|
+        scheme = CONFIG.fetch('auth_schemes', {})[name] || {}
+        scheme['type'] == 'apiKey' && scheme['name'] == parameter['name'] && scheme['in'] == parameter['in']
+      end
+    end
+  end
+
+  # пробуем допустимые варианты auth и берём первый с полным набором credentials
+  def apply_auth!(endpoint, headers, query)
+    alternatives = endpoint.fetch('security', [])
+    return if alternatives.empty?
+
+    alternatives.each do |requirement|
+      candidate_headers = {}
+      candidate_query = []
+      begin
+        requirement.each_key { |name| add_auth_scheme!(CONFIG.fetch('auth_schemes').fetch(name), candidate_headers, candidate_query) }
+        headers.merge!(candidate_headers)
+        query.concat(candidate_query)
+        return
+      rescue InputError
+        next
+      end
+    end
+    raise InputError.new('No security alternative has supported authentication and complete credentials', :configuration_error)
+  end
+
+  # добавляем api key bearer или basic только в выбранный вариант запроса
+  def add_auth_scheme!(scheme, headers, query)
+    case scheme['type']
+    when 'apiKey'
+      value = credential!(scheme['credential'] || 'api_key')
+      case scheme['in']
+      when 'header' then headers[scheme.fetch('name')] = value
+      when 'query' then query << [scheme.fetch('name'), value]
+      else raise InputError.new('Unsupported API key location', :configuration_error)
+      end
+    when 'http'
+      case scheme['scheme'].to_s.downcase
+      when 'bearer' then headers['Authorization'] = "Bearer #{credential!(scheme['credential'] || 'token')}"
+      when 'basic' then headers['Authorization'] = "Basic #{Base64.strict_encode64("#{credential!('username')}:#{credential!('password')}")}"
+      else raise InputError.new('Unsupported HTTP authentication', :configuration_error)
+      end
+    else
+      raise InputError.new('Unsupported authentication scheme', :configuration_error)
+    end
+  end
+
+  # секрет берём из credentials или env и не включаем его в текст ошибки
+  def credential!(name)
+    raise InputError.new('Credentials must be an object', :configuration_error) unless credentials.is_a?(Hash)
+    value = credentials[name] || credentials[name.to_sym] || ENV["#{ENV_PREFIX}_#{name.upcase}"]
+    raise InputError.new("Missing credential: #{name}", :configuration_error) if blank?(value)
+    raise InputError.new('Credential must be a string', :configuration_error) unless value.is_a?(String)
+    raise InputError.new('Credential contains invalid header characters', :configuration_error) if value.to_s.match?(/[\r\n]/)
+
+    value.to_s
+  end
+
+  # при повторе используем тот же id операции а для uuid получаем стабильный ключ
+  def apply_idempotency!(endpoint, operation, headers, query)
+    idempotency = endpoint['idempotency']
+    return unless idempotency && idempotency['name']
+
+    key = canonical_value(operation, 'external_id')
+    raise InputError, 'Operation id is required for idempotency' if blank?(key)
+    parameter = endpoint.fetch('parameters', []).find { |item| item['name'] == idempotency['name'] && item['in'] == idempotency['in'] }
+    key = idempotency_uuid(key) if parameter&.dig('schema', 'format') == 'uuid'
+    validate_schema!(key.to_s, parameter.fetch('schema', {}), idempotency['name']) if parameter
+    case idempotency['in']
+    when 'header' then headers[idempotency['name']] = key.to_s
+    when 'query' then query << [idempotency['name'], key.to_s]
+    else raise InputError.new('Unsupported idempotency location', :configuration_error)
+    end
+  end
+
+  # uuid строим из имени провайдера и id чтобы повторный запрос получил тот же ключ
+  def idempotency_uuid(key)
+    namespace = ['6ba7b8119dad11d180b400c04fd430c8'].pack('H*')
+    bytes = OpenSSL::Digest::SHA1.digest(namespace + "#{CONFIG['provider']}/#{key}").bytes.first(16)
+    bytes[6] = (bytes[6] & 0x0f) | 0x50
+    bytes[8] = (bytes[8] & 0x3f) | 0x80
+    hex = bytes.pack('C*').unpack1('H*')
+    [hex[0, 8], hex[8, 4], hex[12, 4], hex[16, 4], hex[20, 12]].join('-')
+  end
+
+  # вызываем только перечисленные http-методы без динамического выполнения
+  def dispatch(method, url, payload, headers)
+    case method
+    when 'get' then client.get(url, json: payload, headers: headers)
+    when 'post' then client.post(url, json: payload, headers: headers)
+    when 'put' then client.put(url, json: payload, headers: headers)
+    when 'patch' then client.patch(url, json: payload, headers: headers)
+    when 'delete' then client.delete(url, json: payload, headers: headers)
+    else raise InputError.new("Unsupported HTTP method #{method}", :configuration_error)
+    end
+  end
+
+  # проверяем ответ и возвращаем id хосту который сам решает как его сохранить
+  def parse_response(endpoint, response)
+    unless response.respond_to?(:body) && response.respond_to?(:status)
+      raise InputError.new('Provider transport returned an invalid response', :invalid_response)
+    end
+    if response.body.is_a?(String) && response.body.bytesize > MAX_RESPONSE_BYTES
+      raise InputError.new('Provider response exceeds the size limit', :response_too_large)
+    end
+    status = response.status
+    status = status.to_i if status.is_a?(String) && /\A[1-5]\d\d\z/.match?(status)
+    unless status.is_a?(Integer) && (100..599).cover?(status)
+      raise InputError.new('Provider returned an invalid HTTP status', :invalid_response)
+    end
+    # клиент может вернуть уже разобранный объект поэтому проверяем и эту границу
+    unless response.body.is_a?(String)
+      begin
+        validate_json_data!(response.body, limit: MAX_RESPONSE_BYTES, label: 'Provider response')
+      rescue InputError => error
+        raise InputError.new(error.message, :invalid_response)
+      end
+    end
+    return http_failure(endpoint, response, status) unless (200..299).cover?(status)
+
+    body = response.body.is_a?(String) ? parse_json(response.body) : response.body
+    raise InputError.new('Provider response must be a JSON object', :invalid_response) unless body.is_a?(Hash)
+    validate_response!(endpoint, body, status)
+    data = mapped_response(body, endpoint.fetch('response_mappings', {}))
+    data = body if data.empty?
+    if endpoint.fetch('response_mappings', {}).key?('status')
+      data['status'] = canonical_status(data['status'])
+    end
+    id = data['provider_operation_id']
+    if endpoint['role'] == 'create' && blank?(id)
+      raise InputError.new('Provider operation id is missing from create response', :invalid_response)
+    end
+    return success(result: {id: id}) if endpoint['role'] == 'create'
+    success(data)
+  end
+
+  # смысл provider error остаётся в ir а result получает код платформы
+  def http_failure(endpoint, response, status)
+    code = HTTP_FAILURE_CODES.fetch(status, (400..499).cover?(status) ? :bad_request : :bad_gateway)
+    begin
+      body = response.body.is_a?(String) ? parse_json(response.body) : response.body
+    rescue JSON::ParserError
+      body = {}
+    end
+    path = endpoint.fetch('response_mappings', {})['error.message'] || 'error.message'
+    message = value_at(body, path)
+    failure(code, message.is_a?(String) ? message : "Provider HTTP #{status}")
+  end
+
+  # не даём незаявленному 2xx обойти проверку схемы ответа
+  def validate_response!(endpoint, body, status)
+    responses = endpoint.fetch('responses', {})
+    response = responses[status.to_s] || responses['2XX'] || responses['default']
+    raise InputError, 'Provider returned an undocumented success status' unless response
+    content = response.fetch('content', {})
+    media = content.find { |name, _value| name.downcase == 'application/json' || name.downcase.end_with?('+json') }&.last || {}
+    validate_schema!(body, media.fetch('schema', {}), 'response')
+  rescue InputError => error
+    raise InputError.new(error.message, :invalid_response)
+  end
+
+  # раскладываем ответ по полям хоста а сумму возвращаем десятичной строкой
+  def mapped_response(payload, mappings)
+    mappings.each_with_object({}) do |(canonical, source), result|
+      value = value_at(payload, source)
+      next if value.nil?
+      value = response_amount(value) if canonical == 'amount'
+
+      keys = canonical.split('.')
+      leaf = keys.pop
+      parent = keys.reduce(result) { |hash, key| hash[key] ||= {} }
+      parent[leaf] = value
+    end
+  end
+
+  # возвращаем сумму в основных единицах только если деление прошло без потерь
+  def response_amount(value)
+    factor = CONFIG.dig('amount', 'factor')
+    raise InputError.new('Amount factor is unresolved', :configuration_error) unless factor
+
+    original = decimal(value)
+    divisor = decimal(factor)
+    amount = original / divisor
+    unless amount.finite? && amount.exponent.abs <= 308 && amount * divisor == original
+      raise InputError.new('Provider amount cannot be converted exactly', :invalid_response)
+    end
+    amount.to_s('F')
+  rescue ArgumentError, ZeroDivisionError, InputError
+    raise InputError.new('Provider amount is invalid', :invalid_response)
+  end
+
+  def canonical_status(status, code = :invalid_response)
+    STATUS_MAP.fetch(status.to_s) do
+      raise InputError.new("Unknown provider status: #{status.inspect}", code)
+    end
+  end
+
+  # hmac считаем от исходных байтов а подписи сравниваем за постоянное время
+  def verify_signature!(raw_body, headers)
+    signature = CONFIG['signature'] || {}
+    return if signature['algorithm'] == 'none'
+    unless signature['algorithm'] == 'HMAC-SHA256' && signature['signed_data'] == 'raw_body' && !blank?(signature['header'])
+      raise InputError.new('Webhook signature settings are unresolved', :configuration_error)
+    end
+    raise InputError.new('Callback headers must be an object', :invalid_callback) unless headers.is_a?(Hash)
+
+    supplied = headers.find { |name, _value| name.to_s.downcase == signature['header'].to_s.downcase }&.last
+    digest = OpenSSL::HMAC.digest('SHA256', credential!('callback_secret'), raw_body)
+    expected = case signature['encoding']
+               when 'hex' then digest.unpack1('H*')
+               when 'base64' then Base64.strict_encode64(digest)
+               else raise InputError.new('Webhook signature encoding is unresolved', :configuration_error)
+               end
+    unless supplied.is_a?(String) && supplied.bytesize == expected.bytesize && OpenSSL.fixed_length_secure_compare(expected, supplied)
+      raise InputError.new('Callback signature does not match', :invalid_signature)
+    end
+  end
+
+  def value_at(value, path)
+    path.to_s.split('.').reduce(value) do |current, key|
+      break nil unless current.is_a?(Hash)
+      current.key?(key) ? current[key] : current[key.to_sym]
+    end
+  end
+
+  def blank?(value)
+    value.nil? || (value.respond_to?(:empty?) && value.empty?)
+  end
+end
